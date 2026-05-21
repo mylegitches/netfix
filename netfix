@@ -1,0 +1,450 @@
+#!/bin/bash
+# netfix.sh - DNS & Connectivity Troubleshooter
+# Usage: bash netfix.sh [--verbose|-v]
+
+set -euo pipefail
+
+# ── Verbose flag ──────────────────────────────────────
+VERBOSE=0
+if [[ "${1:-}" == "--verbose" ]] || [[ "${1:-}" == "-v" ]]; then
+    VERBOSE=1
+    shift
+fi
+
+LOGDIR="$HOME/netfix"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOGFILE="$LOGDIR/netfix_${TIMESTAMP}.log"
+TARGET=""
+PROBLEM_DOMAIN=""
+DEFAULT_TARGET="https://google.com"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+mkdir -p "$LOGDIR"
+
+log()      { echo -e "$@"; }
+log_file() { echo -e "$@" | tee -a "$LOGFILE"; }
+
+header() {
+    log ""
+    log "${CYAN}═══════════════════════════════════════════${NC}"
+    log "${CYAN}  $1${NC}"
+    log "${CYAN}═══════════════════════════════════════════${NC}"
+}
+
+verbose()  { [[ "$VERBOSE" == 1 ]] && log "  $@" || true; }
+info()     { log "  [INFO]  $1"; verbose "$1"; }
+warn()     { log "${YELLOW}  [WARN]  $1${NC}"; }
+err()      { log "${RED}  [ERR]   $1${NC}"; }
+ok()       { log "${GREEN}  [OK]    $1${NC}"; }
+silent()   { [[ "$VERBOSE" == 1 ]] && log "$@" || true; }
+
+# ── Section 1: Info Gathering ────────────────────────
+collect_info() {
+    header "SYSTEM INFORMATION"
+    log "Timestamp: $(date)"
+    log "Hostname: $(hostname)"
+    log "Kernel: $(uname -r)"
+    log ""
+
+    silent "${YELLOW}--- OS${NC}"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        log "  Distribution: $NAME $VERSION"
+    elif [ -f /etc/redhat-release ]; then
+        log "  Distribution: $(cat /etc/redhat-release)"
+    elif [ -f /etc/debian_version ]; then
+        log "  Distribution: Debian $(cat /etc/debian_version)"
+    else
+        log "  Distribution: $(uname -s)"
+    fi
+
+    log ""
+    silent "${YELLOW}--- Network Interfaces${NC}"
+    ip route | grep -E '^default' | while read line; do
+        log "  Default route: $line"
+    done
+    ip -br addr show | while read line; do
+        log "  $line"
+    done
+
+    log ""
+    silent "${YELLOW}--- DNS Configuration${NC}"
+    if [ -f /etc/resolv.conf ]; then
+        cat /etc/resolv.conf | while read line; do
+            log "  resolv.conf: $line"
+        done
+    fi
+    if [ -f /etc/systemd/resolved.conf ]; then
+        silent "  systemd-resolved: $(grep -v '^#' /etc/systemd/resolved.conf | grep -v '^$')"
+    fi
+
+    silent "${YELLOW}--- DNS Cache Status${NC}"
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        log "  systemd-resolved is ACTIVE"
+        if command -v resolvectl &>/dev/null; then
+            resolvectl status | grep -v "^$" | head -20 | while read line; do
+                log "  $line"
+            done
+        fi
+    else
+        warn "systemd-resolved is NOT running"
+    fi
+
+    log ""
+    silent "${YELLOW}--- Active DNS Connections${NC}"
+    if command -v ss &>/dev/null; then
+        ss -tulnp | grep -E ':53\b' | while read line; do
+            log "  DNS listener: $line"
+        done
+    fi
+
+    if [ -f /etc/hosts ]; then
+        log ""
+        silent "${YELLOW}--- Hosts File${NC}"
+        grep -v '^#' /etc/hosts | grep -v '^$' | while read line; do
+            log "  /etc/hosts: $line"
+        done
+    fi
+
+    log ""
+    silent "${YELLOW}--- Firewall Status${NC}"
+    if command -v ufw &>/dev/null; then
+        log "  UFW: $(ufw status | head -2 | tr -d '\n')"
+    fi
+    if command -v iptables &>/dev/null; then
+        DNS_RULES=$(iptables -L -n 2>/dev/null | grep -c ':53' || echo "0")
+        log "  iptables DNS rules: $DNS_RULES"
+    fi
+
+    log ""
+    silent "${YELLOW}--- External Connectivity${NC}"
+    if command -v curl &>/dev/null; then
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://1.1.1.1 2>/dev/null || echo "FAIL")
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
+            ok "Outbound HTTPS to 1.1.1.1: OK"
+        else
+            warn "Outbound HTTPS to 1.1.1.1: FAILED (code: $HTTP_CODE)"
+        fi
+    fi
+    if command -v ping &>/dev/null; then
+        if ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
+            ok "Ping to 1.1.1.1: OK"
+        else
+            warn "Ping to 1.1.1.1: FAILED"
+        fi
+        if ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+            ok "Ping to 8.8.8.8: OK"
+        else
+            warn "Ping to 8.8.8.8: FAILED"
+        fi
+    fi
+
+    log ""
+    info "Information gathering complete. Log: $LOGFILE"
+}
+
+# ── Section 2: DNS Lookup Diagnostics ────────────────
+diagnose_domain() {
+    [[ -z "$PROBLEM_DOMAIN" ]] && return
+
+    header "DNS LOOKUP: $PROBLEM_DOMAIN"
+    log ""
+
+    if command -v dig &>/dev/null; then
+        log "${YELLOW}--- Querying multiple resolvers${NC}"
+        RESOLVERS="1.1.1.1 8.8.8.8 9.9.9.9 208.67.222.222"
+        for res in $RESOLVERS; do
+            result=$(dig +short +time=3 @"$res" "$PROBLEM_DOMAIN" 2>/dev/null | tr '\n' ' ' || echo "TIMEOUT")
+            [ -z "$result" ] && result="no answer"
+            info "$res → $PROBLEM_DOMAIN = $result"
+        done
+    elif command -v nslookup &>/dev/null; then
+        log "${YELLOW}--- nslookup${NC}"
+        nslookup "$PROBLEM_DOMAIN" 2>&1 | while read line; do
+            log "  $line"
+        done
+    else
+        warn "No dig or nslookup available"
+    fi
+
+    if command -v host &>/dev/null; then
+        log ""
+        log "${YELLOW}--- host command${NC}"
+        host "$PROBLEM_DOMAIN" 2>&1 | while read line; do
+            log "  $line"
+        done
+    fi
+}
+
+# ── Section 3: DNS Cache Check ────────────────────────
+check_dns_cache() {
+    header "DNS CACHE STATUS"
+    log ""
+
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        if command -v resolvectl &>/dev/null; then
+            info "systemd-resolved is ACTIVE"
+            resolvectl status | grep -v "^$" | head -15 | while read line; do
+                log "  $line"
+            done
+        fi
+        log ""
+        read -rp "Flush systemd-resolved DNS cache? [y/N]: " FLUSH_CHOICE
+        if [[ "$FLUSH_CHOICE" =~ ^[Yy]$ ]]; then
+            resolvectl flush-caches 2>&1 | while read line; do
+                log "  $line"
+            done
+            ok "Cache flushed"
+        fi
+    else
+        warn "systemd-resolved is not running"
+    fi
+
+    if pgrep -x nscd &>/dev/null; then
+        log ""
+        info "nscd is running (cache daemon)"
+        read -rp "Flush nscd cache? [y/N]: " FLUSH_CHOICE
+        if [[ "$FLUSH_CHOICE" =~ ^[Yy]$ ]]; then
+            sudo nscd -i hosts 2>&1 | while read line; do
+                log "  $line"
+            done
+            ok "nscd cache flushed"
+        fi
+    fi
+}
+
+# ── Section 4: Change DNS Resolver ───────────────────
+change_dns_resolver() {
+    header "CHANGE DNS RESOLVER"
+    log ""
+
+    log "Current /etc/resolv.conf:"
+    cat /etc/resolv.conf | while read line; do
+        log "  $line"
+    done
+    log ""
+
+    echo "Choose a DNS provider:"
+    echo "  1) Cloudflare (1.1.1.1, 1.0.0.1)"
+    echo "  2) Google (8.8.8.8, 8.8.4.4)"
+    echo "  3) Quad9 (9.9.9.9, 149.112.112.112)"
+    echo "  4) OpenDNS (208.67.222.222, 208.67.220.220)"
+    echo "  5) Custom"
+    echo "  0) Skip"
+    echo ""
+    read -rp "Choice [0-5]: " DNS_CHOICE
+
+    case "$DNS_CHOICE" in
+        1) PRIMARY="1.1.1.1"; SECONDARY="1.0.0.1"; PROVIDER="Cloudflare" ;;
+        2) PRIMARY="8.8.8.8"; SECONDARY="8.8.4.4"; PROVIDER="Google" ;;
+        3) PRIMARY="9.9.9.9"; SECONDARY="149.112.112.112"; PROVIDER="Quad9" ;;
+        4) PRIMARY="208.67.222.222"; SECONDARY="208.67.220.220"; PROVIDER="OpenDNS" ;;
+        5)
+            read -rp "Primary DNS IP: " PRIMARY
+            read -rp "Secondary DNS IP: " SECONDARY
+            PROVIDER="Custom"
+            ;;
+        0|*) info "Skipping"; return ;;
+    esac
+
+    sudo cp /etc/resolv.conf /etc/resolv.conf.backup.$(date +%s) 2>/dev/null || true
+    {
+        echo "# Generated by netfix.sh on $(date)"
+        echo "# Provider: $PROVIDER"
+        echo "nameserver $PRIMARY"
+        echo "nameserver $SECONDARY"
+        echo "nameserver 8.8.8.8"
+    } | sudo tee /etc/resolv.conf > /dev/null
+
+    ok "DNS set to $PROVIDER: $PRIMARY, $SECONDARY"
+}
+
+# ── Section 5: Targeted Test ─────────────────────────
+targeted_test() {
+    header "TARGETED TEST: $TARGET"
+    log ""
+
+    ISSUES_FOUND=0
+
+    # DNS Resolution
+    log "${YELLOW}--- DNS Resolution${NC}"
+    if command -v dig &>/dev/null; then
+        for res in 1.1.1.1 8.8.8.8; do
+            result=$(dig +short +time=3 @"$res" "$PROBLEM_DOMAIN" 2>/dev/null | tr '\n' ' ' || echo "TIMEOUT")
+            [ -z "$result" ] && result="no answer"
+            info "$res → $PROBLEM_DOMAIN = $result"
+        done
+    fi
+
+    # Ping
+    log ""
+    log "${YELLOW}--- Ping${NC}"
+    if command -v ping &>/dev/null; then
+        if ping -c 3 -W 5 "$PROBLEM_DOMAIN" &>/dev/null; then
+            PING_AVG=$(ping -c 3 -W 5 "$PROBLEM_DOMAIN" 2>&1 | grep -oP 'rtt min/avg/max/mdev = [\d.]+/[\d.]+/[\d.]+/[\d.]+' | cut -d'=' -f2 || echo "OK")
+            ok "Ping to $PROBLEM_DOMAIN: $PING_AVG"
+        else
+            warn "Ping to $PROBLEM_DOMAIN: FAILED"
+            ISSUES_FOUND=1
+        fi
+    fi
+
+    # Traceroute
+    log ""
+    log "${YELLOW}--- Traceroute${NC}"
+    if command -v traceroute &>/dev/null; then
+        traceroute -m 12 -w 2 "$PROBLEM_DOMAIN" 2>&1 | head -12 | while read line; do
+            log "  $line"
+        done
+    elif command -v mtr &>/dev/null; then
+        mtr -r -c 3 "$PROBLEM_DOMAIN" 2>&1 | head -12 | while read line; do
+            log "  $line"
+        done
+    else
+        info "No traceroute tool available"
+    fi
+
+    # ── FINAL CURL ──────────────────────────────────────
+    log ""
+    header "FINAL CURL RESULT"
+    log "Target: $TARGET"
+    log ""
+
+    CURL_OUTPUT=$(curl -sL --connect-timeout 10 \
+        -w "\n__HTTP_CODE__: %{http_code}\n__CONNECT_TIME__: %{time_connect}s\n__TTFB__: %{time_starttransfer}s\n__TOTAL_TIME__: %{time_total}s\n__SIZE_DOWNLOAD__: %{size_download}\n__SSL_VERIFY__: %{ssl_verify_result}\n" \
+        "$TARGET" 2>&1)
+
+    HTTP_CODE=$(echo "$CURL_OUTPUT" | grep "__HTTP_CODE__:" | cut -d: -f2 | tr -d ' ')
+    CONNECT_TIME=$(echo "$CURL_OUTPUT" | grep "__CONNECT_TIME__:" | cut -d: -f2 | tr -d 's')
+    TTFB=$(echo "$CURL_OUTPUT" | grep "__TTFB__:" | cut -d: -f2 | tr -d 's')
+    TOTAL_TIME=$(echo "$CURL_OUTPUT" | grep "__TOTAL_TIME__:" | cut -d: -f2 | tr -d 's')
+    SIZE=$(echo "$CURL_OUTPUT" | grep "__SIZE_DOWNLOAD__:" | cut -d: -f2 | tr -d ' ')
+    SSL_VERIFY=$(echo "$CURL_OUTPUT" | grep "__SSL_VERIFY__:" | cut -d: -f2 | tr -d ' ')
+    BODY=$(echo "$CURL_OUTPUT" | sed '/^__.*__:/d')
+
+    # Status
+    if [[ "$HTTP_CODE" =~ ^[2][0-9][0-9]$ ]]; then
+        ok "HTTP $HTTP_CODE ✓"
+    elif [[ "$HTTP_CODE" =~ ^[3][0-9][0-9]$ ]]; then
+        warn "HTTP $HTTP_CODE (redirect)"
+        ISSUES_FOUND=1
+    elif [[ "$HTTP_CODE" =~ ^[4][0-9][0-9]$ ]]; then
+        warn "HTTP $HTTP_CODE (client error)"
+        ISSUES_FOUND=1
+    elif [[ "$HTTP_CODE" =~ ^[5][0-9][0-9]$ ]]; then
+        err "HTTP $HTTP_CODE (server error)"
+        ISSUES_FOUND=1
+    else
+        err "HTTP error: $HTTP_CODE"
+        ISSUES_FOUND=1
+    fi
+
+    log ""
+    log "  Connect time:   ${CONNECT_TIME}s"
+    log "  TTFB:           ${TTFB}s"
+    log "  Total time:     ${TOTAL_TIME}s"
+    log "  Download size:  ${SIZE} bytes"
+    [[ "${SSL_VERIFY:-0}" != "0" ]] && warn "SSL verify result: ${SSL_VERIFY}"
+
+    log ""
+    log "${YELLOW}--- Response Body${NC}"
+    echo "$BODY" | head -30 | while read line; do
+        log "  $line"
+    done
+    log "  ... (${SIZE} bytes total)"
+
+    # HTML detection
+    if echo "$BODY" | grep -qi "<!DOCTYPE\|<html\|<head"; then
+        TITLE=$(echo "$BODY" | grep -oP '(?<=<title>)[^<]+' | head -1 || echo "no <title>")
+        CONTENT_TYPE=$(curl -sI --connect-timeout 5 "$TARGET" 2>/dev/null | grep -i "content-type:" | head -1 | awk '{print $2}' || echo "unknown")
+        log ""
+        log "  Page title: $TITLE"
+        log "  Content-Type: $CONTENT_TYPE"
+    fi
+
+    log ""
+    if [[ "$ISSUES_FOUND" == 1 ]]; then
+        err "Issues found during diagnostics — review above"
+    else
+        ok "All checks passed"
+    fi
+    log "  Full log: $LOGFILE"
+}
+
+# ── Main Menu ────────────────────────────────────────
+show_menu() {
+    header "NETFIX — $TARGET"
+    log ""
+    log "  1) Full diagnostics (all sections)"
+    log "  2) DNS lookup only"
+    log "  3) Check / flush DNS cache"
+    log "  4) Change DNS resolver"
+    log "  5) Re-run targeted test"
+    log "  0) Exit"
+    echo ""
+    read -rp "Choice [0-5]: " CHOICE
+    echo ""
+
+    case "$CHOICE" in
+        1)
+            collect_info
+            diagnose_domain
+            check_dns_cache
+            targeted_test
+            ;;
+        2) diagnose_domain ;;
+        3) check_dns_cache ;;
+        4) change_dns_resolver ;;
+        5) targeted_test ;;
+        0) log "Done."; exit 0 ;;
+        *) warn "Invalid choice"; sleep 1 ;;
+    esac
+
+    echo ""
+    read -rp "Press Enter to continue..." ENTER
+    show_menu
+}
+
+# ── Bootstrap ────────────────────────────────────────
+log "═══════════════════════════════════════════"
+log "  NETFIX — DNS & Connectivity Troubleshooter"
+log "  Verbose: $VERBOSE | Log: $LOGFILE"
+log "═══════════════════════════════════════════"
+
+# Prompt for target
+header "TARGET SETUP"
+read -rp "Enter URL or IP to test (default: $DEFAULT_TARGET): " TARGET
+TARGET=${TARGET:-$DEFAULT_TARGET}
+PROBLEM_DOMAIN=$(echo "$TARGET" | sed 's|https\?://||' | cut -d'/' -f1 | tr -d '[:space:]')
+log ""
+info "Target: $TARGET"
+info "Host:   $PROBLEM_DOMAIN"
+log ""
+
+# Run info gathering silently unless verbose
+if [[ "$VERBOSE" == 1 ]]; then
+    collect_info
+else
+    log "[ Run with --verbose for full diagnostic output ]"
+    log ""
+    # Always check external connectivity silently
+    if command -v curl &>/dev/null; then
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://1.1.1.1 2>/dev/null || echo "FAIL")
+        [[ "$HTTP_CODE" != "200" ]] && [[ "$HTTP_CODE" != "301" ]] && [[ "$HTTP_CODE" != "302" ]] && warn "Outbound HTTPS to 1.1.1.1 failed (code: $HTTP_CODE)"
+    fi
+    if command -v ping &>/dev/null && ! ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
+        warn "Ping to 1.1.1.1 failed"
+    fi
+fi
+
+# Run targeted test
+targeted_test
+
+# Show menu
+show_menu
